@@ -12,9 +12,12 @@ import Tip.Utils.Rename
 import Tip.Utils
 import Data.Generics.Geniplate
 import Data.Maybe
-import Data.Char (isAlphaNum)
+import Data.Char (isAlphaNum,isDigit)
 import Data.List (sortBy)
 import Data.Ord (comparing)
+
+import Control.Monad.State
+import Control.Monad
 
 validChar :: Char -> String
 validChar x
@@ -22,12 +25,14 @@ validChar x
   | x `elem` ("~!@$%^&*_-+=<>.?/" :: String) = [x]
   | otherwise                                = ""
 
-ppTheory :: (Ord a,PrettyVar a) => Theory a -> Doc
+type AxInfo = [(Info String,(Term,Term))]
+
+ppTheory :: (Ord a,PrettyVar a) => Theory a -> (Doc,AxInfo)
 ppTheory
   (renameWithBlocks keywords
     (disambig (concatMap validChar . varStr))
       -> thy@Theory{..}) =
-  vcat
+  (vcat
     [ "NAME" <+> "emna"
     , "MODE" <+> "PROOF"
     , "SORTS" $\ vcat (map (ppVar . sort_name) thy_sorts)
@@ -46,6 +51,10 @@ ppTheory
     , "EQUATIONS" $\ vcat (map ppFormula as)
     , "CONCLUSION" $\ ppFormula g
     ]
+  , [ (i,(toTerm (fmap varStr e1),toTerm (fmap varStr e2)))
+    | Formula _ i _ (forallView -> (_,Builtin Equal :@: [e1,e2])) <- as
+    ]
+  )
   where
   ([g],as) = theoryGoals thy
 
@@ -72,7 +81,97 @@ ppExpr Let{}        = error "Waldmeister: lift let declarations"
 
 ppHead :: (Ord a, PrettyVar a) => Head a -> Doc
 ppHead (Gbl (Global g _ _)) = ppVar g
+ppHead (Builtin (Lit (Bool b))) = text (show b)
 ppHead (Builtin b)          = error $ "Waldmeister: cannot handle any builtins! Offending builtin:" ++ show b
 
 keywords :: [String]
 keywords = words "> -> : NAME MODE SORTS SIGNATURE ORDERING LPO KBO VARIABLES EQUATIONS CONCLUSION PROOF COMPLETION"
+
+-- Simple terms
+
+data Term = Node String [Term]
+  deriving (Eq,Ord,Show)
+
+toTerm :: Expr String -> Term
+toTerm (Lcl (Local x _)) = Node x []
+toTerm (Gbl (Global x _ _) :@: xs) = Node x (map toTerm xs)
+toTerm (Builtin Equal :@: xs) = Node " = " (map toTerm xs)
+toTerm e = error $ "toTerm: " ++ ppRender e
+
+renTerm :: Term -> Term
+renTerm (Node s ts) = Node (ren s) (map renTerm ts)
+  where
+  ren "mult"   = "*"
+  ren "plus"   = "+"
+  ren "elem"   = "`elem`"
+  ren "equals" = "=="
+  ren "and"    = "&&"
+  ren "or"     = "||"
+  ren "append" = "++"
+  ren "cons"   = ":"
+  ren "nil"    = "[]"
+  ren s        = s
+
+ppTerm :: Term -> String
+ppTerm = go 0 . renTerm
+  where
+  go _ (Node ":" [t1,Node "[]" []]) = "[" ++ go 0 t1 ++ "]"
+  go i (Node s [t1,t2])
+    | any op s = par_if (i > 0) (go 1 t1 ++ s ++ go 1 t2)
+  go i (Node s []) = s
+  go i (Node s as) = par_if (i > 1) (unwords (s:map (go 2) as))
+
+  par_if True  s = "(" ++ s ++ ")"
+  par_if False s = s :: String
+
+op x | x `elem` (" `:~!@$%^&*_-+=<>.?/|" :: String) = True
+     | otherwise = False
+
+beautifyTerm :: String -> String
+beautifyTerm s = maybe s ppTerm (readTerm s)
+
+readTerm :: String -> Maybe Term
+readTerm s =
+  case span isAlphaNum s of
+    (h,"") -> Just (Node h [])
+    (h,t)  -> fmap (Node h) (mapM readTerm =<< matching t)
+
+matching :: String -> Maybe [String]
+matching ('(':xs) = go 0 xs
+  where
+  go i ('(':xs)    = add '(' (go (i+1) xs)
+  go 0 (',':xs)    = fmap ([]:) (go 0 xs)
+  go 0 (')':xs)    = if null xs then Just [] else Nothing
+  go i (')':xs)    = add ')' (go (i-1) xs)
+  go i (x:xs)      = add x (go i xs)
+  go _ []          = Just []
+
+  add :: Char -> Maybe [String] -> Maybe [String]
+  add x (Just [])       = Just [[x]]
+  add x (Just (xs:xss)) = Just ((x:xs):xss)
+  add _ Nothing         = Nothing
+
+matching s        = Nothing
+
+matchEq :: (Term,Term) -> (Term,Term) -> Bool
+matchEq (u,v) (s,t) =
+  or [ match (Node "" uv) (Node "" [s,t])
+     | uv <- [[u,v],[v,u]]
+     ]
+
+match :: Term -> Term -> Bool
+match t1 t2 = evalState (go t1 t2) []
+  where
+  go :: Term -> Term -> State [(String,Term)] Bool
+  go (Node s@('x':r) []) t | all isDigit r =
+    do m <- gets (lookup s)
+       case m of
+         Nothing -> do modify ((s,t):)
+                       return True
+         Just t' -> do return (t == t')
+  go (Node a as) (Node b bs) =
+    do let ok1 = a == b
+       let ok2 = length as == length bs
+       oks <- zipWithM go as bs
+       return (and (ok1:ok2:oks))
+

@@ -7,18 +7,22 @@ module Main where
 
 import Tip.HaskellFrontend
 import Tip.QuickSpec
-import Tip.Core
+import Tip.Core hiding (Unknown)
 import Tip.Fresh
 import Tip.Passes
 import Tip.Pretty
 import Tip.Scope
 import Tip.Pretty.SMT as SMT
 
+import Debug.Trace
+
 import Tip.Utils.Rename
 
 import Data.Generics.Geniplate
 
-import Data.List (sort, isInfixOf)
+import Data.Maybe
+import Data.List (sort, sortBy, isInfixOf, nub)
+import Data.Ord
 import Data.Char
 
 import qualified Data.Traversable as T
@@ -49,6 +53,7 @@ data Args =
     { file    :: String
     , explore :: Bool
     , indvars :: Int
+    , timeout :: Double
     }
   deriving (Show,Data,Typeable)
 
@@ -58,6 +63,7 @@ defArgs =
     { file    = ""    &= argPos 0 &= typFile
     , explore = False &= name "e" &= help "Explore theory"
     , indvars = 1     &= name "v" &= help "Number of variables to do induction on"
+    , timeout = 1     &= name "t" &= help "Timeout in seconds (default 1)"
     }
   &= program "emna" &= summary "simple inductive prover with proof output"
 
@@ -77,7 +83,8 @@ main = do
     head . freshPass
       (runPasses
         [ UncurryTheory
-        , SimplifyAggressively
+        , SimplifyGently
+        , RemoveBuiltinBool
         ])
 
 data I = I Int String
@@ -104,11 +111,13 @@ loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   go b     (c:cs) q thy =
     do r <- tryProve args prover c thy
        case r of
-         True  -> go True cs q     thy{ thy_asserts = makeProved c:thy_asserts thy }
+         True  -> go True cs q     thy{ thy_asserts =
+                                          let lms = thy_asserts thy
+                                          in  makeProved (length lms) c:lms }
          False -> go b    cs (c:q) thy
 
-makeProved :: Formula a -> Formula a
-makeProved (Formula _ tvs b) = Formula Assert tvs b
+makeProved :: Int -> Formula a -> Formula a
+makeProved i (Formula _ _ tvs b) = Formula Assert (Lemma i) tvs b
 
 formulaVars :: Formula a -> [Local a]
 formulaVars = fst . forallView . fm_body
@@ -119,15 +128,15 @@ tryProve args prover fm thy =
 
      ptree :: Tree (Promise [Obligation Result]) <- T.traverse (promise prover) tree
 
-     let timeout      = 1000 * 1000 -- microseconds
+     let timeout'     = round (timeout args * 1000 * 1000) -- microseconds
          processes    = 2
 
-     workers (Just timeout) processes (interleave ptree)
+     workers (Just timeout') processes (interleave ptree)
 
      let (prenex,term) = forallView (renameWith (disambig varStr) (fm_body fm))
 
-     -- putStrLn (ppRender term)
-     putStrLn (ppTerm (toTerm term))
+     putStrLn "Considering:"
+     putStrLn $ "  " ++ (ppTerm (toTerm term))
 
      (errs,res) <- evalTree (any (not . isSuccess) . map ob_content) ptree
 
@@ -139,9 +148,9 @@ tryProve args prover fm thy =
                     then putStrLn $ "Proved without using induction"
                     else putStrLn $ "Proved by induction on " ++ unwords (map (lcl_name . (prenex !!)) coords)
                  sequence_
-                   [ do pf <- parsePCL s
+                   [ do pf <- parsePCL ax_list s
                         putStrLn pf
-                   | Obligation _ (Success (Just s)) <- res
+                   | Obligation _ (Success (Just (s,ax_list))) <- res
                    ]
 
          | otherwise
@@ -177,7 +186,9 @@ obligations args fm thy0 =
   where
   combine xs =
     do i <- [0..indvars args]
-       replicateM i xs
+       us <- replicateM i xs
+       guard (nub us == us)
+       return us
   pack coords thys =
     requireAll
       [ Leaf (Obligation (ObInduction coords i (length thys)) thy)
@@ -200,7 +211,7 @@ data ObInfo
       }
   deriving (Eq,Ord,Show)
 
-data Result = Success (Maybe String) | Disproved | Unknown ProcessResult
+data Result = Success (Maybe (String,AxInfo)) | Disproved | Unknown ProcessResult
   deriving (Eq,Ord,Show)
 
 isUnknown :: Result -> Bool
@@ -215,22 +226,23 @@ data Prover = Prover
   { prover_cmd    :: String -> (String,[String])
   , prover_ext    :: String
   , prover_passes :: [StandardPass]
-  , prover_pretty :: forall a . Name a => Theory a -> Doc
-  , prover_pipe   :: ProcessResult -> Result
+  , prover_pretty :: forall a . Name a => Theory a -> Theory a -> (Doc,AxInfo)
+  , prover_pipe   :: AxInfo -> ProcessResult -> Result
   }
 
 promise :: Name a => Prover -> Obligation (Theory a) -> IO (Promise [Obligation Result])
 promise Prover{..} (Obligation info thy) =
   do u <- newUnique
      let filename = "/tmp/" ++ show (hashUnique u) ++ prover_ext
-     writeFile filename (show (prover_pretty (head (freshPass (runPasses prover_passes) thy))))
+     let (thy_pretty,axiom_list) = prover_pretty thy (head (freshPass (runPasses prover_passes) thy))
+     writeFile filename (show thy_pretty)
      let (prog,args) = prover_cmd filename
      promise <- processPromise prog args ""
 
      let update :: PromiseResult ProcessResult -> PromiseResult [Obligation Result]
          update Cancelled = Cancelled
          update Unfinished = Unfinished
-         update (An pr) = An [Obligation info (prover_pipe pr)]
+         update (An pr) = An [Obligation info (prover_pipe axiom_list pr)]
 
      return promise{ result = fmap update (result promise) }
 
@@ -246,9 +258,9 @@ z3 = Prover
       , SimplifyGently, Monomorphise False
       , SimplifyGently, NegateConjecture
       ]
-  , prover_pretty = SMT.ppTheory
+  , prover_pretty = \ _ thy -> (SMT.ppTheory thy,[])
   , prover_pipe =
-      \ pr@(ProcessResult err out exc) ->
+      \ _ pr@(ProcessResult err out exc) ->
           if "unsat" `isInfixOf` out
              then Success Nothing
              else Unknown pr
@@ -261,35 +273,64 @@ waldmeister = Prover
   , prover_passes =
       [ TypeSkolemConjecture, Monomorphise False
       , LambdaLift, AxiomatizeLambdas, LetLift
-      , SimplifyGently, BoolOpToIf, CommuteMatch, RemoveBuiltinBool
-      , SimplifyGently, CollapseEqual, RemoveAliases
-      , SimplifyGently, AxiomatizeFuncdefs2, AxiomatizeDatadeclsUEQ
-      , SimplifyGently, Monomorphise False
+      , CollapseEqual, RemoveAliases
+      , AxiomatizeFuncdefs2, AxiomatizeDatadeclsUEQ
+      , Monomorphise False
       , SkolemiseConjecture
       ]
-  , prover_pretty = Waldmeister.ppTheory . niceRename
+  , prover_pretty = \ orig -> Waldmeister.ppTheory . niceRename orig
   , prover_pipe =
-      \ pr@(ProcessResult err out exc) ->
+      \ ax_list pr@(ProcessResult err out exc) ->
           if "Waldmeister states: Goal proved." `isInfixOf` out
-             then Success (Just err)
+             then Success (Just (err,ax_list))
              else if "Waldmeister states: System completed." `isInfixOf` out
                then Disproved
                else Unknown pr
   }
   where
 
-parsePCL :: String -> IO String
-parsePCL s =
+parsePCL :: AxInfo -> String -> IO String
+parsePCL axiom_list s =
   do (exc, out, err) <-
        readProcessWithExitCode
          "proof"
          (words "-nolemmas -nosubst -noplace -nobrackets")
          s
 
-     return (findProof out)
+     let axs = mapMaybe unaxiom . lines $ out
+
+     let matches =
+           [ (n,i)
+           | (n,uv) <- axs
+           , (i,st) <- axiom_list
+           , matchEq uv st
+           ]
+
+     return (findProof matches out
+             {-
+             ++ "\n" ++ out
+             ++ "\n" ++ unlines [ ppTerm e1 ++ " = " ++ ppTerm e2 ++ " " ++ show n | (n,(e1,e2)) <- axs ]
+             ++ "\n" ++ unlines [ ppTerm e1 ++ " = " ++ ppTerm e2 ++ " " ++ prettyInfo ax  | (ax,(e1,e2)) <- axiom_list ]
+             ++ "\n" ++ "matches: \n" ++
+             unlines [ show n ++ " : " ++ prettyInfo i | (n,i) <- matches ]
+             ++ "\n" ++ s
+             -}
+             )
   where
-  findProof = unlines . map (reparse . changeTheorem) . drop 2 . dropWhile (/= "Proof:") . lines
-  changeTheorem = removeBy . change [("Theorem 1","To show")]
+  findProof ms = unlines . map (reparse . changeTheorem ms) . drop 2 . dropWhile (/= "Proof:") . lines
+  changeTheorem ms = removeBy ms . change [("Theorem 1","To show")]
+
+  ax = "  Axiom "
+
+  unaxiom s
+    | (ax',rest) <- splitAt (length ax) s
+    , ax == ax'
+    , [(num,':':' ':terms)] <- reads rest
+    , (s1,' ':'=':' ':s2) <- break (== ' ') terms
+    , Just t1 <- readTerm s1
+    , Just t2 <- readTerm s2
+    = Just (num :: Int,(t1,t2))
+  unaxiom _ = Nothing
 
   reparse (' ':xs) = ' ':reparse xs
   reparse [] = []
@@ -297,8 +338,29 @@ parsePCL s =
     let (u,v) =  span (/= ' ') xs
     in  beautifyTerm u ++ reparse v
 
-  removeBy s | "by Axiom" `isInfixOf` s = " ="
-  removeBy s = s
+  byax = "by Axiom "
+
+  removeBy ms s
+    | (byax',rest) <- splitAt (length byax) s
+    , byax == byax'
+    , [(num,blabla)] <- reads rest
+    , Just i <- lookup num ms
+    = prettyInfo i
+  removeBy ms (x:xs) = x:removeBy ms xs
+  removeBy _  [] = []
+
+prettyInfo :: Info String -> String
+prettyInfo i =
+  case i of
+    Definition f      -> "by definition of " ++ f
+    IH i              -> "by IH " ++ show i
+    Lemma i           -> "by lemma " ++ show i
+    DataDomain d      -> ""
+    DataProjection d  -> "by projection of " ++ d
+    DataDistinct d    -> ""
+    Defunction f      -> "by defunctionalisation of " ++ f
+    UserAsserted      -> ""
+    _                 -> ""
 
 change :: Ord a => [([a],[a])] -> [a] -> [a]
 change _   []        = []
@@ -315,25 +377,57 @@ newtype Ren = Ren String
   deriving (Eq,Ord,Show)
 
 instance PrettyVar Ren where
-  varStr (Ren s) = s
+  varStr (Ren s) = case s of
+                     "x" -> "v"
+                     _   -> s
 
-niceRename :: (Ord a,PrettyVar a) => Theory a -> Theory Ren
-niceRename thy =
+data Prod f g a = [a] :*: g a
+  deriving (Eq,Ord,Show,Functor,Traversable,Foldable)
+
+sND (_ :*: b) = b
+
+niceRename :: (Ord a,PrettyVar a) => Theory a -> Theory a -> Theory Ren
+niceRename thy_orig thy =
+  sND $
   fmap Ren $
-  renameWith (disambig $ suggestWithTypes lcl_rn gbl_rn thy) thy
+  renameWith (disambig $ suggestWithTypes lcl_rn gbl_rn thy_orig thy)
+             (concat interesting :*: thy)
   where
-  lcl_rn (Local x t)
-    | is_list t = "xs"
-    | otherwise = "x"
+  interesting =
+    sortBy (flip $ comparing length)
+      [ [ k2 `asTypeOf` k
+        | Gbl (Global k2 (PolyType _ [] _) _) :@: _ <- as
+        , varStr k2 `notElem` constructors
+        ]
+      | Formula Prove _ _ fm <- thy_asserts thy
+      , Gbl (Global k _ _) :@: as <- universeBi fm
+      , varStr k `elem` constructors
+      ]
 
-  is_list t =
+  lcl_rn (Local x t)
+    | is "list" t = "xs"
+    | is "nat" t  = "n"
+    | is "bool" t = "p"
+    | otherwise   = "x"
+
+  is s t =
     case fmap varStr t of
-      TyCon list _ -> "list" `isInfixOf` map toLower list
+      TyCon list _ -> s `isInfixOf` map toLower list
       _ -> False
 
+  constructors =
+    [ varStr k
+    | (k,ConstructorInfo{}) <- M.toList (Tip.Scope.globals (scope thy_orig))
+    ]
+
+  gbl_rn a _ | varStr a `elem` constructors = varStr a
   gbl_rn a (FunctionInfo (PolyType _ [] t))
-    | varStr a /= "nil" && is_list t = "as"
-    | varStr a /= "nil" && otherwise = "a"
+    | not (any ((>= 2) . length) interesting)
+      || or [ a `elem` xs | xs <- interesting, length xs >= 2 ]
+       = case () of
+           () | is "list" t -> "as" -- check that a is element in a list with >=2 elements
+              | otherwise   -> "a"  -- in the interesting list
+    | otherwise = lcl_rn (Local a t)
   gbl_rn a _ = varStr a
 
 suggestWithTypes ::
@@ -341,74 +435,25 @@ suggestWithTypes ::
   (Local a -> String) ->
   (a -> GlobalInfo a -> String) ->
   Theory a ->
+  Theory a ->
   (a -> String)
-suggestWithTypes lcl_rn gbl_rn thy =
+suggestWithTypes lcl_rn gbl_rn thy_orig thy =
   \ a ->
-   case M.lookup a all_locals of
+   case M.lookup a all_locals_orig of
      Just t -> lcl_rn (Local a t)
      Nothing ->
-       case lookupGlobal a scp of
+       case lookupGlobal a scp_orig of
          Just gi -> gbl_rn a gi
-         Nothing -> varStr a
+         Nothing ->
+           case M.lookup a all_locals of
+             Just t -> lcl_rn (Local a t)
+             Nothing ->
+               case lookupGlobal a scp of
+                 Just gi -> gbl_rn a gi
+                 Nothing -> varStr a
   where
-  all_locals = M.fromList [ (x,t) | Local x t <- universeBi thy ]
-  scp        = scope thy
-
-data Term = Node String [Term]
-  deriving (Eq,Ord,Show)
-
-toTerm :: Expr String -> Term
-toTerm (Lcl (Local x _)) = Node x []
-toTerm (Gbl (Global x _ _) :@: xs) = Node x (map toTerm xs)
-toTerm (Builtin Equal :@: xs) = Node " = " (map toTerm xs)
-toTerm e = error $ "toTerm: " ++ ppRender e
-
-renTerm :: Term -> Term
-renTerm (Node s ts) = Node (ren s) (map renTerm ts)
-  where
-  ren "append" = "++"
-  ren "cons"   = ":"
-  ren "nil"    = "[]"
-  ren s        = s
-
-ppTerm :: Term -> String
-ppTerm = go 0 . renTerm
-  where
-  go _ (Node ":" [t1,Node "[]" []]) = "[" ++ go 0 t1 ++ "]"
-  go i (Node s [t1,t2])
-    | all op s = par_if (i > 0) (go 1 t1 ++ s ++ go 1 t2)
-  go i (Node s []) = s
-  go i (Node s as) = par_if (i > 1) (unwords (s:map (go 2) as))
-
-  par_if True  s = "(" ++ s ++ ")"
-  par_if False s = s
-
-op x | x `elem` (" :~!@$%^&*_-+=<>.?/" :: String) = True
-     | otherwise = False
-
-beautifyTerm :: String -> String
-beautifyTerm s = maybe s ppTerm (readTerm s)
-
-readTerm :: String -> Maybe Term
-readTerm s =
-  case span isAlphaNum s of
-    (h,"") -> Just (Node h [])
-    (h,t)  -> fmap (Node h) (mapM readTerm =<< matching t)
-
-matching :: String -> Maybe [String]
-matching ('(':xs) = go 0 xs
-  where
-  go i ('(':xs)    = add '(' (go (i+1) xs)
-  go 0 (',':xs)    = fmap ([]:) (go 0 xs)
-  go 0 (')':xs)    = if null xs then Just [] else Nothing
-  go i (')':xs)    = add ')' (go (i-1) xs)
-  go i (x:xs)      = add x (go i xs)
-  go _ []          = Just []
-
-  add :: Char -> Maybe [String] -> Maybe [String]
-  add x (Just [])       = Just [[x]]
-  add x (Just (xs:xss)) = Just ((x:xs):xss)
-  add _ Nothing         = Nothing
-
-matching s        = Nothing
+  all_locals_orig = M.fromList [ (x,t) | Local x t <- universeBi thy_orig ]
+  scp_orig        = scope thy_orig
+  all_locals      = M.fromList [ (x,t) | Local x t <- universeBi thy ]
+  scp             = scope thy
 
