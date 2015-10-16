@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE Rank2Types #-}
@@ -10,19 +11,25 @@ import Tip.Core
 import Tip.Fresh
 import Tip.Passes
 import Tip.Pretty
+import Tip.Scope
 import Tip.Pretty.SMT as SMT
 
 import Tip.Utils.Rename
 
+import Data.Generics.Geniplate
+
 import Data.List (sort, isInfixOf)
+import Data.Char
 
 import qualified Data.Traversable as T
 
 import Data.Unique
 
+import Control.Monad
+
 import Control.Concurrent.STM.Promise
 import Control.Concurrent.STM.Promise.Process
-import Control.Concurrent.STM.Promise.Tree
+import Control.Concurrent.STM.Promise.Tree hiding (Node)
 import Control.Concurrent.STM.Promise.Workers
 
 import Text.PrettyPrint (Doc)
@@ -31,27 +38,60 @@ import System.Environment
 
 import Waldmeister
 
+import System.Console.CmdArgs
+
+import qualified Data.Map as M
+import Data.Map (Map)
+
+data Args =
+  Args
+    { file    :: String
+    , explore :: Bool
+    , indvars :: Int
+    }
+  deriving (Show,Data,Typeable)
+
+defArgs :: Args
+defArgs =
+  Args
+    { file    = ""    &= argPos 0 &= typFile
+    , explore = False &= name "e" &= help "Explore theory"
+    , indvars = 1     &= name "v" &= help "Number of variables to do induction on"
+    }
+  &= program "emna" &= summary "simple inductive prover with proof output"
 
 main :: IO ()
 main = do
-  [file] <- getArgs
-  loop waldmeister =<< exploreTheory =<< fmap (either error ren) (readHaskellOrTipFile file defaultParams)
+  args@Args{..} <- cmdArgs defArgs
+  x <- readHaskellOrTipFile file defaultParams
+  case x of
+    Left err  -> putStrLn err
+    Right thy ->
+      do loop args waldmeister =<<
+           ((if explore then exploreTheory else return)
+            (passes (ren thy)) )
   where
   ren = renameWith (\ x -> [ I i (varStr x) | i <- [0..] ])
+  passes =
+    head . freshPass
+      (runPasses
+        [ UncurryTheory
+        , SimplifyAggressively
+        ])
 
 data I = I Int String
   deriving (Eq,Ord,Show)
 
 instance PrettyVar I where
-   varStr (I x s) = s
+  varStr (I x s) = s
 
 instance Name I where
   fresh             = refresh (I undefined "x")
   refresh (I _ s)   = do u <- fresh; return (I u s)
   getUnique (I u _) = u
 
-loop :: Name a => Prover -> Theory a -> IO ()
-loop prover thy = go False conjs [] thy{ thy_asserts = assums }
+loop :: Name a => Args -> Prover -> Theory a -> IO ()
+loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   where
   (conjs,assums) = theoryGoals thy
 
@@ -60,7 +100,7 @@ loop prover thy = go False conjs [] thy{ thy_asserts = assums }
   go True  []     q thy = do putStrLn "Reconsidering conjectures..."
                              go False (reverse q) [] thy
   go b     (c:cs) q thy =
-    do r <- tryProve prover c thy
+    do r <- tryProve args prover c thy
        case r of
          True  -> go True cs q     thy{ thy_asserts = makeProved c:thy_asserts thy }
          False -> go b    cs (c:q) thy
@@ -71,9 +111,9 @@ makeProved (Formula _ tvs b) = Formula Assert tvs b
 formulaVars :: Formula a -> [Local a]
 formulaVars = fst . forallView . fm_body
 
-tryProve :: Name a => Prover -> Formula a -> Theory a -> IO Bool
-tryProve prover fm thy =
-  do let tree = freshPass (obligations fm) thy
+tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO Bool
+tryProve args prover fm thy =
+  do let tree = freshPass (obligations args fm) thy
 
      ptree :: Tree (Promise [Obligation Result]) <- T.traverse (promise prover) tree
 
@@ -84,7 +124,8 @@ tryProve prover fm thy =
 
      let (prenex,term) = forallView (renameWith (disambig varStr) (fm_body fm))
 
-     putStrLn (ppRender term)
+     -- putStrLn (ppRender term)
+     putStrLn (ppTerm (toTerm term))
 
      (errs,res) <- evalTree (any (not . isSuccess) . map ob_content) ptree
 
@@ -117,18 +158,20 @@ tryProve prover fm thy =
 
      return (not (null res))
 
-obligations :: Name a => Formula a -> Theory a -> Fresh (Tree (Obligation (Theory a)))
-obligations fm thy0 =
+obligations :: Name a => Args -> Formula a -> Theory a -> Fresh (Tree (Obligation (Theory a)))
+obligations args fm thy0 =
   requireAny <$>
     sequence
       [ pack coords <$>
           runPass
             (Induction coords)
             (thy0 { thy_asserts = fm : thy_asserts thy0})
-      | coords <- []:combine [ [i] | (_,i) <- formulaVars fm `zip` [0..] ]
+      | coords <- combine [ i | (_,i) <- formulaVars fm `zip` [0..] ]
       ]
   where
-  combine xs = xs ++ [ ys ++ zs | ys <- xs, zs <- xs, ys /= zs ]
+  combine xs =
+    do i <- [0..indvars args]
+       replicateM i xs
   pack coords thys =
     requireAll
       [ Leaf (Obligation (ObInduction coords i (length thys)) thy)
@@ -207,7 +250,7 @@ z3 = Prover
 
 waldmeister :: Prover
 waldmeister = Prover
-  { prover_cmd = \ filename -> ("waldmeister",[filename,"--auto"])
+  { prover_cmd = \ filename -> ("waldmeister",[filename,"--auto"{-,"--details"-}])
   , prover_ext = ".w"
   , prover_passes =
       [ TypeSkolemConjecture, Monomorphise False
@@ -217,18 +260,25 @@ waldmeister = Prover
       , SimplifyGently, Monomorphise False
       , SkolemiseConjecture
       ]
-  , prover_pretty = Waldmeister.ppTheory
+  , prover_pretty = Waldmeister.ppTheory . niceRename
   , prover_pipe =
       \ pr@(ProcessResult err out exc) ->
           if "Waldmeister states: Goal proved." `isInfixOf` out
-             then Success (findProof out)
+             then -- Success ("RAW: " ++ out ++ "\n\nFIXED: " ++ findProof out)
+                  Success (findProof out)
              else if "Waldmeister states: System completed." `isInfixOf` out
                then Disproved
                else Unknown pr
   }
   where
-  findProof = unlines . map changeTheorem . drop 2 . dropWhile (/= "Proof:") . lines
-  changeTheorem = removeBy . change [("Theorem 1","Case")]
+  findProof = unlines . map (reparse . changeTheorem) . drop 2 . dropWhile (/= "Proof:") . lines
+  changeTheorem = removeBy . change [("Theorem 1","To show")]
+
+  reparse (' ':xs) = ' ':reparse xs
+  reparse [] = []
+  reparse xs =
+    let (u,v) =  span (/= ' ') xs
+    in  beautifyTerm u ++ reparse v
 
   removeBy s | "by Axiom" `isInfixOf` s = " ="
   removeBy s = s
@@ -244,4 +294,104 @@ change tbl xs@(y:ys) =
     r:_ -> r
     []  -> y:change tbl ys
 
+newtype Ren = Ren String
+  deriving (Eq,Ord,Show)
+
+instance PrettyVar Ren where
+  varStr (Ren s) = s
+
+niceRename :: (Ord a,PrettyVar a) => Theory a -> Theory Ren
+niceRename thy =
+  fmap Ren $
+  renameWith (disambig $ suggestWithTypes lcl_rn gbl_rn thy) thy
+  where
+  lcl_rn (Local x t)
+    | is_list t = "xs"
+    | otherwise = "x"
+
+  is_list t =
+    case fmap varStr t of
+      TyCon list _ -> "list" `isInfixOf` map toLower list
+      _ -> False
+
+  gbl_rn a (FunctionInfo (PolyType _ [] t))
+    | varStr a /= "nil" && is_list t = "as"
+    | varStr a /= "nil" && otherwise = "a"
+  gbl_rn a _ = varStr a
+
+suggestWithTypes ::
+  (Ord a, PrettyVar a) =>
+  (Local a -> String) ->
+  (a -> GlobalInfo a -> String) ->
+  Theory a ->
+  (a -> String)
+suggestWithTypes lcl_rn gbl_rn thy =
+  \ a ->
+   case M.lookup a all_locals of
+     Just t -> lcl_rn (Local a t)
+     Nothing ->
+       case lookupGlobal a scp of
+         Just gi -> gbl_rn a gi
+         Nothing -> varStr a
+  where
+  all_locals = M.fromList [ (x,t) | Local x t <- universeBi thy ]
+  scp        = scope thy
+
+data Term = Node String [Term]
+  deriving (Eq,Ord,Show)
+
+toTerm :: Expr String -> Term
+toTerm (Lcl (Local x _)) = Node x []
+toTerm (Gbl (Global x _ _) :@: xs) = Node x (map toTerm xs)
+toTerm (Builtin Equal :@: xs) = Node " = " (map toTerm xs)
+toTerm e = error $ "toTerm: " ++ ppRender e
+
+renTerm :: Term -> Term
+renTerm (Node s ts) = Node (ren s) (map renTerm ts)
+  where
+  ren "append" = "++"
+  ren "cons"   = ":"
+  ren "nil"    = "[]"
+  ren s        = s
+
+ppTerm :: Term -> String
+ppTerm = go 0 . renTerm
+  where
+  go _ (Node ":" [t1,Node "[]" []]) = "[" ++ go 0 t1 ++ "]"
+  go i (Node s [t1,t2])
+    | all op s = par_if (i > 0) (go 1 t1 ++ s ++ go 1 t2)
+  go i (Node s []) = s
+  go i (Node s as) = par_if (i > 1) (unwords (s:map (go 2) as))
+
+  par_if True  s = "(" ++ s ++ ")"
+  par_if False s = s
+
+op x | x `elem` (" :~!@$%^&*_-+=<>.?/" :: String) = True
+     | otherwise = False
+
+beautifyTerm :: String -> String
+beautifyTerm s = maybe s ppTerm (readTerm s)
+
+readTerm :: String -> Maybe Term
+readTerm s =
+  case span isAlphaNum s of
+    (h,"") -> Just (Node h [])
+    (h,t)  -> fmap (Node h) (mapM readTerm =<< matching t)
+
+matching :: String -> Maybe [String]
+matching ('(':xs) = go 0 xs
+  where
+  go i ('(':xs)    = add '(' (go (i+1) xs)
+  go 0 (',':xs)    = fmap ([]:) (go 0 xs)
+  go 0 (')':xs)    = if null xs then Just [] else Nothing
+  go i (')':xs)    = add ')' (go (i-1) xs)
+  go i (x:xs)      = add x (go i xs)
+  go _ []          = Just []
+
+  add :: Char -> Maybe [String] -> Maybe [String]
+  add x (Just [])       = Just [[x]]
+  add x (Just (xs:xss)) = Just ((x:xs):xss)
+  add _ Nothing         = Nothing
+
+matching s        = Nothing
 
