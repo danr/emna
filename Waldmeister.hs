@@ -3,6 +3,8 @@ module Waldmeister where
 
 import Text.PrettyPrint
 
+import qualified Tip.Pretty.SMT as SMT
+
 import Tip.Pretty
 import Tip.Types
 import Tip.Core
@@ -49,7 +51,7 @@ ppTheory
 
 ppType :: (Ord a, PrettyVar a) => Type a -> Doc
 ppType (TyCon t []) = ppVar t
-ppType _            = error "Waldmeister: cannot handle any sophisticated types"
+ppType t            = error $ "Waldmeister: cannot handle any sophisticated types: " ++ show (SMT.ppType t)
 
 ppSig :: (Ord a,PrettyVar a) => Signature a -> Doc
 ppSig (Signature f (PolyType [] arg_types res_type)) =

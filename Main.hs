@@ -39,6 +39,7 @@ import System.Environment
 import Waldmeister
 
 import System.Console.CmdArgs
+import System.Process (readProcessWithExitCode)
 
 import qualified Data.Map as M
 import Data.Map (Map)
@@ -88,6 +89,7 @@ instance PrettyVar I where
 instance Name I where
   fresh             = refresh (I undefined "x")
   refresh (I _ s)   = do u <- fresh; return (I u s)
+  freshNamed s      = refresh  (I 0 s)
   getUnique (I u _) = u
 
 loop :: Name a => Args -> Prover -> Theory a -> IO ()
@@ -136,7 +138,11 @@ tryProve args prover fm thy =
            -> do if null coords
                     then putStrLn $ "Proved without using induction"
                     else putStrLn $ "Proved by induction on " ++ unwords (map (lcl_name . (prenex !!)) coords)
-                 sequence_ [ putStrLn s | Obligation _ (Success s) <- res, not (null s) ]
+                 sequence_
+                   [ do pf <- parsePCL s
+                        putStrLn pf
+                   | Obligation _ (Success (Just s)) <- res
+                   ]
 
          | otherwise
            -> do putStrLn $ "Confusion :("
@@ -194,7 +200,7 @@ data ObInfo
       }
   deriving (Eq,Ord,Show)
 
-data Result = Success String | Disproved | Unknown ProcessResult
+data Result = Success (Maybe String) | Disproved | Unknown ProcessResult
   deriving (Eq,Ord,Show)
 
 isUnknown :: Result -> Bool
@@ -244,17 +250,18 @@ z3 = Prover
   , prover_pipe =
       \ pr@(ProcessResult err out exc) ->
           if "unsat" `isInfixOf` out
-             then Success ""
+             then Success Nothing
              else Unknown pr
   }
 
 waldmeister :: Prover
 waldmeister = Prover
-  { prover_cmd = \ filename -> ("waldmeister",[filename,"--auto"{-,"--details"-}])
+  { prover_cmd = \ filename -> ("waldmeister",filename:["--auto","--output=/dev/stderr","--pcl"])
   , prover_ext = ".w"
   , prover_passes =
       [ TypeSkolemConjecture, Monomorphise False
       , LambdaLift, AxiomatizeLambdas, LetLift
+      , SimplifyGently, BoolOpToIf, CommuteMatch, RemoveBuiltinBool
       , SimplifyGently, CollapseEqual, RemoveAliases
       , SimplifyGently, AxiomatizeFuncdefs2, AxiomatizeDatadeclsUEQ
       , SimplifyGently, Monomorphise False
@@ -264,12 +271,22 @@ waldmeister = Prover
   , prover_pipe =
       \ pr@(ProcessResult err out exc) ->
           if "Waldmeister states: Goal proved." `isInfixOf` out
-             then -- Success ("RAW: " ++ out ++ "\n\nFIXED: " ++ findProof out)
-                  Success (findProof out)
+             then Success (Just err)
              else if "Waldmeister states: System completed." `isInfixOf` out
                then Disproved
                else Unknown pr
   }
+  where
+
+parsePCL :: String -> IO String
+parsePCL s =
+  do (exc, out, err) <-
+       readProcessWithExitCode
+         "proof"
+         (words "-nolemmas -nosubst -noplace -nobrackets")
+         s
+
+     return (findProof out)
   where
   findProof = unlines . map (reparse . changeTheorem) . drop 2 . dropWhile (/= "Proof:") . lines
   changeTheorem = removeBy . change [("Theorem 1","To show")]
