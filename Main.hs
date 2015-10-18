@@ -42,6 +42,7 @@ import System.Environment
 
 import Waldmeister
 
+import qualified System.IO as IO
 import System.Console.CmdArgs
 import System.Process (readProcessWithExitCode)
 
@@ -54,6 +55,8 @@ data Args =
     , explore :: Bool
     , indvars :: Int
     , timeout :: Double
+    , filenames :: Bool
+    , prover    :: String
     }
   deriving (Show,Data,Typeable)
 
@@ -64,6 +67,8 @@ defArgs =
     , explore = False &= name "e" &= help "Explore theory"
     , indvars = 1     &= name "v" &= help "Number of variables to do induction on"
     , timeout = 1     &= name "t" &= help "Timeout in seconds (default 1)"
+    , filenames = False           &= help "Print out filenames of theories"
+    , prover = "w"                &= help "Prover (waldmeister/z3)"
     }
   &= program "emna" &= summary "simple inductive prover with proof output"
 
@@ -74,7 +79,10 @@ main = do
   case x of
     Left err  -> putStrLn err
     Right thy ->
-      do loop args waldmeister =<<
+      do let p = case prover of
+                  'w':_ -> waldmeister
+                  'z':_ -> z3
+         loop args p =<<
            ((if explore then exploreTheory else return)
             (passes (ren thy)) )
   where
@@ -96,7 +104,7 @@ instance PrettyVar I where
 instance Name I where
   fresh             = refresh (I undefined "x")
   refresh (I _ s)   = do u <- fresh; return (I u s)
-  freshNamed s      = refresh  (I 0 s)
+  freshNamed s      = refresh (I undefined s)
   getUnique (I u _) = u
 
 loop :: Name a => Args -> Prover -> Theory a -> IO ()
@@ -126,17 +134,20 @@ tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO Bool
 tryProve args prover fm thy =
   do let tree = freshPass (obligations args fm) thy
 
-     ptree :: Tree (Promise [Obligation Result]) <- T.traverse (promise prover) tree
+     ptree :: Tree (Promise [Obligation Result]) <- T.traverse (promise args prover) tree
 
      let timeout'     = round (timeout args * 1000 * 1000) -- microseconds
          processes    = 2
 
      workers (Just timeout') processes (interleave ptree)
 
-     let (prenex,term) = forallView (renameWith (disambig varStr) (fm_body fm))
+     let (prenex,term) =
+           forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
+             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
 
      putStrLn "Considering:"
      putStrLn $ "  " ++ (ppTerm (toTerm term))
+     IO.hFlush IO.stdout
 
      (errs,res) <- evalTree (any (not . isSuccess) . map ob_content) ptree
 
@@ -147,11 +158,13 @@ tryProve args prover fm thy =
            -> do if null coords
                     then putStrLn $ "Proved without using induction"
                     else putStrLn $ "Proved by induction on " ++ unwords (map (lcl_name . (prenex !!)) coords)
-                 sequence_
-                   [ do pf <- parsePCL ax_list s
-                        putStrLn pf
-                   | Obligation _ (Success (Just (s,ax_list))) <- res
-                   ]
+                 let steps =
+                       [ do pf <- parsePCL ax_list s
+                            putStrLn pf
+                       | Obligation _ (Success (Just (s,ax_list))) <- res
+                       ]
+                 unless (null steps) $ do putStrLn "Proof:"
+                                          sequence_ steps
 
          | otherwise
            -> do putStrLn $ "Confusion :("
@@ -177,15 +190,16 @@ obligations :: Name a => Args -> Formula a -> Theory a -> Fresh (Tree (Obligatio
 obligations args fm thy0 =
   requireAny <$>
     sequence
-      [ pack coords <$>
-          runPass
-            (Induction coords)
-            (thy0 { thy_asserts = fm : thy_asserts thy0})
+      [ do body' <- freshen (fm_body fm)
+           pack coords <$>
+             runPass
+               (Induction coords)
+               (thy0 { thy_asserts = fm{ fm_body = body' } : thy_asserts thy0})
       | coords <- combine [ i | (_,i) <- formulaVars fm `zip` [0..] ]
       ]
   where
   combine xs =
-    do i <- [0..indvars args]
+    do i <- [0] ++ reverse [1..indvars args]
        us <- replicateM i xs
        guard (nub us == us)
        return us
@@ -230,10 +244,11 @@ data Prover = Prover
   , prover_pipe   :: AxInfo -> ProcessResult -> Result
   }
 
-promise :: Name a => Prover -> Obligation (Theory a) -> IO (Promise [Obligation Result])
-promise Prover{..} (Obligation info thy) =
+promise :: Name a => Args -> Prover -> Obligation (Theory a) -> IO (Promise [Obligation Result])
+promise args Prover{..} (Obligation info thy) =
   do u <- newUnique
      let filename = "/tmp/" ++ show (hashUnique u) ++ prover_ext
+     when (filenames args) (putStrLn filename)
      let (thy_pretty,axiom_list) = prover_pretty thy (head (freshPass (runPasses prover_passes) thy))
      writeFile filename (show thy_pretty)
      let (prog,args) = prover_cmd filename
@@ -256,6 +271,7 @@ z3 = Prover
       , SimplifyGently, CollapseEqual, RemoveAliases
       , SimplifyGently, AxiomatizeFuncdefs2
       , SimplifyGently, Monomorphise False
+      , SimplifyGently, SkolemiseConjecture
       , SimplifyGently, NegateConjecture
       ]
   , prover_pretty = \ _ thy -> (SMT.ppTheory thy,[])
@@ -317,8 +333,39 @@ parsePCL axiom_list s =
              -}
              )
   where
-  findProof ms = unlines . map (reparse . changeTheorem ms) . drop 2 . dropWhile (/= "Proof:") . lines
-  changeTheorem ms = removeBy ms . change [("Theorem 1","To show")]
+  findProof ms = unlines . fmt . collect ms . drop 2 . dropWhile (/= "Proof:") . lines
+
+  fmt :: ([String],[String],[String]) -> [String]
+  fmt (eqs,reasons,thm:_)
+    = ( " To show:" ++ reparse (drop (length "  Theorem 1:") thm))
+    : [ "     " ++ prettyInfo i ++ ": " ++ ppTerm u ++ " = " ++ ppTerm v
+      | (i@(IH _),(u,v)) <- axiom_list
+      ] ++
+      ""
+    : [ h ++ " " ++ u ++ replicate (2 + l - length u) ' ' ++ r
+      | (h,(u,r)) <-
+          ("  ":repeat " =") `zip`
+          (eqs `zip` ("":[ "[" ++ r ++ "]" | r <- reasons ]))
+      ]
+    where
+    l = maximum (0:map length eqs)
+
+  collect :: [(Int,Info String)] -> [String] -> ([String],[String],[String])
+  collect ms ((' ':' ':' ':' ':t):ts)
+    | Just u <- readTerm t
+    , (a,b,c) <- collect ms ts
+    = (ppTerm u:a,b,c)
+  collect ms ((' ':'=':' ':' ':' ':' ':s):ts)
+    | (byax',rest) <- splitAt (length byax) s
+    , byax == byax'
+    , [(num,blabla)] <- reads rest
+    , Just i <- lookup num ms
+    , (a,b,c) <- collect ms ts
+    = (a,prettyInfo i:b,c)
+  collect ms (what:ts)
+    | (a,b,c) <- collect ms ts
+    = (a,b,what:c)
+  collect _ [] = ([],[],[])
 
   ax = "  Axiom "
 
@@ -340,38 +387,18 @@ parsePCL axiom_list s =
 
   byax = "by Axiom "
 
-  removeBy ms s
-    | (byax',rest) <- splitAt (length byax) s
-    , byax == byax'
-    , [(num,blabla)] <- reads rest
-    , Just i <- lookup num ms
-    = prettyInfo i
-  removeBy ms (x:xs) = x:removeBy ms xs
-  removeBy _  [] = []
-
 prettyInfo :: Info String -> String
 prettyInfo i =
   case i of
-    Definition f      -> "by definition of " ++ f
-    IH i              -> "by IH " ++ show i
-    Lemma i           -> "by lemma " ++ show i
+    Definition f      -> ren f ++ " def"
+    IH i              -> "IH" ++ show (i+1)
+    Lemma i           -> "lemma " ++ show i
     DataDomain d      -> ""
-    DataProjection d  -> "by projection of " ++ d
+    DataProjection d  -> d ++ " projection"
     DataDistinct d    -> ""
     Defunction f      -> "by defunctionalisation of " ++ f
     UserAsserted      -> ""
     _                 -> ""
-
-change :: Ord a => [([a],[a])] -> [a] -> [a]
-change _   []        = []
-change tbl xs@(y:ys) =
-  case
-    [ v ++ change tbl (drop (length k) xs)
-    | (k,v) <- tbl
-    , take (length k) xs == k
-    ] of
-    r:_ -> r
-    []  -> y:change tbl ys
 
 newtype Ren = Ren String
   deriving (Eq,Ord,Show)
@@ -405,6 +432,7 @@ niceRename thy_orig thy =
       ]
 
   lcl_rn (Local x t)
+    | is "tree" t = "p"
     | is "list" t = "xs"
     | is "nat" t  = "n"
     | is "bool" t = "p"

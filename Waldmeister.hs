@@ -101,16 +101,18 @@ toTerm e = error $ "toTerm: " ++ ppRender e
 renTerm :: Term -> Term
 renTerm (Node s ts) = Node (ren s) (map renTerm ts)
   where
-  ren "mult"   = "*"
-  ren "plus"   = "+"
-  ren "elem"   = "`elem`"
-  ren "equals" = "=="
-  ren "and"    = "&&"
-  ren "or"     = "||"
-  ren "append" = "++"
-  ren "cons"   = ":"
-  ren "nil"    = "[]"
-  ren s        = s
+
+ren :: String -> String
+ren "mult"   = "*"
+ren "plus"   = "+"
+ren "elem"   = "`elem`"
+ren "equals" = "=="
+ren "and"    = "&&"
+ren "or"     = "||"
+ren "append" = "++"
+ren "cons"   = ":"
+ren "nil"    = "[]"
+ren s        = s
 
 ppTerm :: Term -> String
 ppTerm = go 0 . renTerm
