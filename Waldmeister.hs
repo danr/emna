@@ -96,6 +96,7 @@ toTerm :: Expr String -> Term
 toTerm (Lcl (Local x _)) = Node x []
 toTerm (Gbl (Global x _ _) :@: xs) = Node x (map toTerm xs)
 toTerm (Builtin Equal :@: xs) = Node " = " (map toTerm xs)
+toTerm (Builtin Implies :@: xs) = Node " => " (map toTerm xs)
 toTerm e = error $ "toTerm: " ++ ppRender e
 
 renTerm :: Term -> Term
@@ -105,6 +106,7 @@ renTerm (Node s ts) = Node (ren s) (map renTerm ts)
 ren :: String -> String
 ren "mult"   = "*"
 ren "plus"   = "+"
+ren "minus"  = "-"
 ren "elem"   = "`elem`"
 ren "equals" = "=="
 ren "and"    = "&&"
@@ -126,6 +128,9 @@ ppTerm = go 0 . renTerm
   par_if True  s = "(" ++ s ++ ")"
   par_if False s = s :: String
 
+ppEquation :: (Term,Term) -> String
+ppEquation (u,v) = ppTerm u ++ " = " ++ ppTerm v
+
 op x | x `elem` (" `:~!@$%^&*_-+=<>.?/|" :: String) = True
      | otherwise = False
 
@@ -137,6 +142,14 @@ readTerm s =
   case span isAlphaNum s of
     (h,"") -> Just (Node h [])
     (h,t)  -> fmap (Node h) (mapM readTerm =<< matching t)
+
+readEquation :: String -> Maybe (Term,Term)
+readEquation s
+  | (s1,' ':'=':' ':s2) <- break (== ' ') s
+  , Just t1 <- readTerm s1
+  , Just t2 <- readTerm s2
+  = Just (t1,t2)
+readEquation _ = Nothing
 
 matching :: String -> Maybe [String]
 matching ('(':xs) = go 0 xs
@@ -176,4 +189,10 @@ match t1 t2 = evalState (go t1 t2) []
        let ok2 = length as == length bs
        oks <- zipWithM go as bs
        return (and (ok1:ok2:oks))
+
+nodesOf :: Term -> [String]
+nodesOf (Node s xs) = s:concatMap nodesOf xs
+
+nodesOfEq :: (Term,Term) -> [String]
+nodesOfEq (u,v) = nodesOf u ++ nodesOf v
 

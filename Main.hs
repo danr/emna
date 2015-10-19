@@ -17,11 +17,12 @@ import Tip.Pretty.SMT as SMT
 import Debug.Trace
 
 import Tip.Utils.Rename
+import Tip.Utils (usort)
 
 import Data.Generics.Geniplate
 
 import Data.Maybe
-import Data.List (sort, sortBy, isInfixOf, nub)
+import Data.List (sort, sortBy, isInfixOf, nub, (\\), intercalate)
 import Data.Ord
 import Data.Char
 
@@ -79,21 +80,21 @@ main = do
   case x of
     Left err  -> putStrLn err
     Right thy ->
-      do let p = case prover of
-                  'w':_ -> waldmeister
-                  'z':_ -> z3
+      do let (rmb,p) = case prover of
+                        'w':_ -> (True, waldmeister)
+                        'z':_ -> (False,z3)
          loop args p =<<
            ((if explore then exploreTheory else return)
-            (passes (ren thy)) )
+            (passes rmb (ren thy)) )
   where
   ren = renameWith (\ x -> [ I i (varStr x) | i <- [0..] ])
-  passes =
+  passes rmb =
     head . freshPass
-      (runPasses
+      (runPasses $
         [ UncurryTheory
         , SimplifyGently
-        , RemoveBuiltinBool
-        ])
+        ] ++
+        [ RemoveBuiltinBool | rmb ])
 
 data I = I Int String
   deriving (Eq,Ord,Show)
@@ -132,7 +133,15 @@ formulaVars = fst . forallView . fm_body
 
 tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO Bool
 tryProve args prover fm thy =
-  do let tree = freshPass (obligations args fm) thy
+  do let (prenex,term) =
+           forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
+             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
+
+     putStrLn "Considering:"
+     putStrLn $ "  " ++ (ppTerm (toTerm term))
+     IO.hFlush IO.stdout
+
+     let tree = freshPass (obligations args fm) thy
 
      ptree :: Tree (Promise [Obligation Result]) <- T.traverse (promise args prover) tree
 
@@ -140,14 +149,6 @@ tryProve args prover fm thy =
          processes    = 2
 
      workers (Just timeout') processes (interleave ptree)
-
-     let (prenex,term) =
-           forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
-             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
-
-     putStrLn "Considering:"
-     putStrLn $ "  " ++ (ppTerm (toTerm term))
-     IO.hFlush IO.stdout
 
      (errs,res) <- evalTree (any (not . isSuccess) . map ob_content) ptree
 
@@ -157,7 +158,7 @@ tryProve args prover fm thy =
          , all (isSuccess . ob_content) res
            -> do if null coords
                     then putStrLn $ "Proved without using induction"
-                    else putStrLn $ "Proved by induction on " ++ unwords (map (lcl_name . (prenex !!)) coords)
+                    else putStrLn $ "Proved by induction on " ++ intercalate ", " (map (lcl_name . (prenex !!)) coords)
                  let steps =
                        [ do pf <- parsePCL ax_list s
                             putStrLn pf
@@ -337,9 +338,11 @@ parsePCL axiom_list s =
 
   fmt :: ([String],[String],[String]) -> [String]
   fmt (eqs,reasons,thm:_)
-    = ( " To show:" ++ reparse (drop (length "  Theorem 1:") thm))
-    : [ "     " ++ prettyInfo i ++ ": " ++ ppTerm u ++ " = " ++ ppTerm v
-      | (i@(IH _),(u,v)) <- axiom_list
+    = ( " To show: " ++ ppEquation to_show)
+    : [ "     " ++ prettyInfo i ++ ": " ++ ppEquation ih
+        ++ if null vars then "" else "  (for all " ++ intercalate ", " vars ++ ")"
+      | (i@(IH _),ih) <- axiom_list
+      , let vars = nub (nodesOfEq ih) \\ nub (nodesOfEq to_show)
       ] ++
       ""
     : [ h ++ " " ++ u ++ replicate (2 + l - length u) ' ' ++ r
@@ -348,6 +351,7 @@ parsePCL axiom_list s =
           (eqs `zip` ("":[ "[" ++ r ++ "]" | r <- reasons ]))
       ]
     where
+    Just to_show = readEquation (drop (length "  Theorem 1: ") thm)
     l = maximum (0:map length eqs)
 
   collect :: [(Int,Info String)] -> [String] -> ([String],[String],[String])
@@ -373,9 +377,7 @@ parsePCL axiom_list s =
     | (ax',rest) <- splitAt (length ax) s
     , ax == ax'
     , [(num,':':' ':terms)] <- reads rest
-    , (s1,' ':'=':' ':s2) <- break (== ' ') terms
-    , Just t1 <- readTerm s1
-    , Just t2 <- readTerm s2
+    , Just (t1,t2) <- readEquation terms
     = Just (num :: Int,(t1,t2))
   unaxiom _ = Nothing
 
