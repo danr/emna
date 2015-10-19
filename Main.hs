@@ -83,9 +83,11 @@ main = do
       do let (rmb,p) = case prover of
                         'w':_ -> (True, waldmeister)
                         'z':_ -> (False,z3)
-         loop args p =<<
+         m <- loop args p =<<
            ((if explore then exploreTheory else return)
             (passes rmb (ren thy)) )
+         putStrLn "\nSummary:"
+         m
   where
   ren = renameWith (\ x -> [ I i (varStr x) | i <- [0..] ])
   passes rmb =
@@ -108,22 +110,28 @@ instance Name I where
   freshNamed s      = refresh (I undefined s)
   getUnique (I u _) = u
 
-loop :: Name a => Args -> Prover -> Theory a -> IO ()
+loop :: Name a => Args -> Prover -> Theory a -> IO (IO ())
 loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   where
   (conjs,assums) = theoryGoals thy
 
-  go _     []     [] _  = putStrLn "Finished!"
-  go False []     _ _   = return ()
+  go _     []     [] _  = do putStrLn "Finished!"
+                             return (return ())
+  go False []     _ _   = return (return ())
   go True  []     q thy = do putStrLn "Reconsidering conjectures..."
                              go False (reverse q) [] thy
   go b     (c:cs) q thy =
-    do r <- tryProve args prover c thy
-       case r of
-         True  -> go True cs q     thy{ thy_asserts =
-                                          let lms = thy_asserts thy
-                                          in  makeProved (length lms) c:lms }
-         False -> go b    cs (c:q) thy
+    do (str,m_lemmas) <- tryProve args prover c thy
+       case m_lemmas of
+         Just lemmas ->
+           do let lms = thy_asserts thy
+              let n = (length lms)
+              m <- go True cs q thy{ thy_asserts = makeProved n c:lms }
+              return $ do putStrLn $ pad (show n) 2 ++ ": " ++ rpad str 40 ++
+                                     if null lemmas then ""
+                                        else " using " ++ intercalate ", " (map show lemmas)
+                          m
+         Nothing -> go b    cs (c:q) thy
 
 makeProved :: Int -> Formula a -> Formula a
 makeProved i (Formula _ _ tvs b) = Formula Assert (Lemma i) tvs b
@@ -131,7 +139,7 @@ makeProved i (Formula _ _ tvs b) = Formula Assert (Lemma i) tvs b
 formulaVars :: Formula a -> [Local a]
 formulaVars = fst . forallView . fm_body
 
-tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO Bool
+tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO (String,Maybe [Int])
 tryProve args prover fm thy =
   do let (prenex,term) =
            forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
@@ -152,7 +160,7 @@ tryProve args prover fm thy =
 
      (errs,res) <- evalTree (any (not . isSuccess) . map ob_content) ptree
 
-     case res of
+     mlemmas <- case res of
        Obligation (ObInduction coords _ n) _:_
          | sort (map (ind_num . ob_info) res) == [0..n-1]
          , all (isSuccess . ob_content) res
@@ -160,18 +168,22 @@ tryProve args prover fm thy =
                     then putStrLn $ "Proved without using induction"
                     else putStrLn $ "Proved by induction on " ++ intercalate ", " (map (lcl_name . (prenex !!)) coords)
                  let steps =
-                       [ do pf <- parsePCL ax_list s
+                       [ do (pf,lemmas) <- parsePCL ax_list s
                             putStrLn pf
+                            return lemmas
                        | Obligation _ (Success (Just (s,ax_list))) <- res
                        ]
-                 unless (null steps) $ do putStrLn "Proof:"
-                                          sequence_ steps
+                 if null steps then return (Just [])
+                   else do putStrLn "Proof:"
+                           (Just . concat) <$> sequence steps
 
          | otherwise
            -> do putStrLn $ "Confusion :("
                  mapM_ print res
+                 return Nothing
 
-       _ -> putStrLn "Failed to prove."
+       _ -> do putStrLn "Failed to prove."
+               return Nothing
 
      -- mapM_ print res
 
@@ -185,7 +197,7 @@ tryProve args prover fm thy =
        | e <-  errs
        ]
 
-     return (not (null res))
+     return (ppTerm (toTerm term), if null res then Nothing else fmap usort mlemmas)
 
 obligations :: Name a => Args -> Formula a -> Theory a -> Fresh (Tree (Obligation (Theory a)))
 obligations args fm thy0 =
@@ -306,7 +318,13 @@ waldmeister = Prover
   }
   where
 
-parsePCL :: AxInfo -> String -> IO String
+pad :: String -> Int -> String
+pad s i = replicate (i - length s) ' ' ++ s
+
+rpad :: String -> Int -> String
+rpad s i = s ++ replicate (i - length s) ' '
+
+parsePCL :: AxInfo -> String -> IO (String,[Int])
 parsePCL axiom_list s =
   do (exc, out, err) <-
        readProcessWithExitCode
@@ -323,7 +341,10 @@ parsePCL axiom_list s =
            , matchEq uv st
            ]
 
-     return (findProof matches out
+     let collected :: ([String],[Info String],[String])
+         collected@(_,used,_) = collect matches . drop 2 . dropWhile (/= "Proof:") . lines $ out
+
+     return (unlines (fmt collected),[ i | Lemma i <- used ])
              {-
              ++ "\n" ++ out
              ++ "\n" ++ unlines [ ppTerm e1 ++ " = " ++ ppTerm e2 ++ " " ++ show n | (n,(e1,e2)) <- axs ]
@@ -332,11 +353,9 @@ parsePCL axiom_list s =
              unlines [ show n ++ " : " ++ prettyInfo i | (n,i) <- matches ]
              ++ "\n" ++ s
              -}
-             )
-  where
-  findProof ms = unlines . fmt . collect ms . drop 2 . dropWhile (/= "Proof:") . lines
 
-  fmt :: ([String],[String],[String]) -> [String]
+  where
+  fmt :: ([String],[Info String],[String]) -> [String]
   fmt (eqs,reasons,thm:_)
     = ( " To show: " ++ ppEquation to_show)
     : [ "     " ++ prettyInfo i ++ ": " ++ ppEquation ih
@@ -348,13 +367,13 @@ parsePCL axiom_list s =
     : [ h ++ " " ++ u ++ replicate (2 + l - length u) ' ' ++ r
       | (h,(u,r)) <-
           ("  ":repeat " =") `zip`
-          (eqs `zip` ("":[ "[" ++ r ++ "]" | r <- reasons ]))
+          (eqs `zip` ("":[ "[" ++ prettyInfo r ++ "]" | r <- reasons ]))
       ]
     where
     Just to_show = readEquation (drop (length "  Theorem 1: ") thm)
     l = maximum (0:map length eqs)
 
-  collect :: [(Int,Info String)] -> [String] -> ([String],[String],[String])
+  collect :: [(Int,Info String)] -> [String] -> ([String],[Info String],[String])
   collect ms ((' ':' ':' ':' ':t):ts)
     | Just u <- readTerm t
     , (a,b,c) <- collect ms ts
@@ -365,7 +384,7 @@ parsePCL axiom_list s =
     , [(num,blabla)] <- reads rest
     , Just i <- lookup num ms
     , (a,b,c) <- collect ms ts
-    = (a,prettyInfo i:b,c)
+    = (a,i:b,c)
   collect ms (what:ts)
     | (a,b,c) <- collect ms ts
     = (a,b,what:c)
