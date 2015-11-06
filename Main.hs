@@ -65,7 +65,7 @@ defArgs :: Args
 defArgs =
   Args
     { file    = ""    &= argPos 0 &= typFile
-    , explore = False &= name "e" &= help "Explore theory"
+    , explore = True  &= name "e" &= help "Explore theory"
     , indvars = 1     &= name "v" &= help "Number of variables to do induction on"
     , timeout = 1     &= name "t" &= help "Timeout in seconds (default 1)"
     , filenames = False           &= help "Print out filenames of theories"
