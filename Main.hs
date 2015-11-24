@@ -149,7 +149,7 @@ tryProve args prover fm thy =
      putStrLn $ "  " ++ (ppTerm (toTerm term))
      IO.hFlush IO.stdout
 
-     let tree = freshPass (obligations args fm) thy
+     let tree = freshPass (obligations args fm (prover_pre prover)) thy
 
      ptree :: Tree (Promise [Obligation Result]) <- T.traverse (promise args prover) tree
 
@@ -199,14 +199,14 @@ tryProve args prover fm thy =
 
      return (ppTerm (toTerm term), if null res then Nothing else fmap usort mlemmas)
 
-obligations :: Name a => Args -> Formula a -> Theory a -> Fresh (Tree (Obligation (Theory a)))
-obligations args fm thy0 =
+obligations :: Name a => Args -> Formula a -> [StandardPass] -> Theory a -> Fresh (Tree (Obligation (Theory a)))
+obligations args fm pre_passes thy0 =
   requireAny <$>
     sequence
       [ do body' <- freshen (fm_body fm)
            pack coords <$>
-             runPass
-               (Induction coords)
+             runPasses
+               (pre_passes ++ [Induction coords])
                (thy0 { thy_asserts = fm{ fm_body = body' } : thy_asserts thy0})
       | coords <- combine [ i | (_,i) <- formulaVars fm `zip` [0..] ]
       ]
@@ -252,7 +252,8 @@ isSuccess _         = False
 data Prover = Prover
   { prover_cmd    :: String -> (String,[String])
   , prover_ext    :: String
-  , prover_passes :: [StandardPass]
+  , prover_pre    :: [StandardPass]
+  , prover_post   :: [StandardPass]
   , prover_pretty :: forall a . Name a => Theory a -> Theory a -> (Doc,AxInfo)
   , prover_pipe   :: AxInfo -> ProcessResult -> Result
   }
@@ -262,7 +263,7 @@ promise args Prover{..} (Obligation info thy) =
   do u <- newUnique
      let filename = "/tmp/" ++ show (hashUnique u) ++ prover_ext
      when (filenames args) (putStrLn filename)
-     let (thy_pretty,axiom_list) = prover_pretty thy (head (freshPass (runPasses prover_passes) thy))
+     let (thy_pretty,axiom_list) = prover_pretty thy (head (freshPass (runPasses prover_post) thy))
      writeFile filename (show thy_pretty)
      let (prog,args) = prover_cmd filename
      promise <- processPromise prog args ""
@@ -278,14 +279,16 @@ z3 :: Prover
 z3 = Prover
   { prover_cmd = \ filename -> ("z3",["-smt2",filename])
   , prover_ext = ".smt2"
-  , prover_passes =
+  , prover_pre =
       [ TypeSkolemConjecture, Monomorphise False
-      , LambdaLift, AxiomatizeLambdas
+      , SimplifyGently, LambdaLift, AxiomatizeLambdas, Monomorphise False
       , SimplifyGently, CollapseEqual, RemoveAliases
-      , SimplifyGently, AxiomatizeFuncdefs2
-      , SimplifyGently, Monomorphise False
-      , SimplifyGently, SkolemiseConjecture
-      , SimplifyGently, NegateConjecture
+      , SimplifyGently
+      ]
+  , prover_post =
+      [ AxiomatizeFuncdefs2
+      , SkolemiseConjecture
+      , NegateConjecture
       ]
   , prover_pretty = \ _ thy -> (SMT.ppTheory thy,[])
   , prover_pipe =
@@ -299,12 +302,14 @@ waldmeister :: Prover
 waldmeister = Prover
   { prover_cmd = \ filename -> ("waldmeister",filename:["--auto","--output=/dev/stderr","--pcl"])
   , prover_ext = ".w"
-  , prover_passes =
+  , prover_pre =
       [ TypeSkolemConjecture, Monomorphise False
       , LambdaLift, AxiomatizeLambdas, LetLift
       , CollapseEqual, RemoveAliases
-      , AxiomatizeFuncdefs2, AxiomatizeDatadeclsUEQ
       , Monomorphise False
+      ]
+  , prover_post =
+      [ AxiomatizeFuncdefs2, AxiomatizeDatadeclsUEQ
       , SkolemiseConjecture
       ]
   , prover_pretty = \ orig -> Waldmeister.ppTheory . niceRename orig
