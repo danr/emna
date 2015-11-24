@@ -97,6 +97,7 @@ toTerm (Lcl (Local x _)) = Node x []
 toTerm (Gbl (Global x _ _) :@: xs) = Node x (map toTerm xs)
 toTerm (Builtin Equal :@: xs) = Node " = " (map toTerm xs)
 toTerm (Builtin Implies :@: xs) = Node " => " (map toTerm xs)
+toTerm (Lam ls e) = Node "\\" (map (\ (Local x _) -> Node x []) ls ++ [toTerm e])
 toTerm e = error $ "toTerm: " ++ ppRender e
 
 renTerm :: Term -> Term
@@ -123,6 +124,9 @@ ppTerm = go 0 . renTerm
   go i (Node s [t1,t2])
     | any op s = par_if (i > 0) (go 1 t1 ++ s ++ go 1 t2)
   go i (Node s []) = s
+  go i (Node "\\" as) =
+    let (vs,[e]) = splitAt (length as - 1) as
+    in  par_if (i > 1) ("\\ " ++ unwords (map (go 0) vs) ++ " -> " ++ go 0 e)
   go i (Node s as) = par_if (i > 1) (unwords (s:map (go 2) as))
 
   par_if True  s = "(" ++ s ++ ")"
