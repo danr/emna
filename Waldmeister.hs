@@ -98,6 +98,11 @@ toTerm (Gbl (Global x _ _) :@: xs) = Node x (map toTerm xs)
 toTerm (Builtin Equal :@: xs) = Node " = " (map toTerm xs)
 toTerm (Builtin Implies :@: xs) = Node " => " (map toTerm xs)
 toTerm (Builtin At :@: xs) = Node "@" (map toTerm xs)
+toTerm (Builtin Not :@: xs) = Node "not" (map toTerm xs)
+toTerm (Builtin And :@: xs) = Node "&&" (map toTerm xs)
+toTerm (Builtin Or :@: xs) = Node "||" (map toTerm xs)
+toTerm (Builtin (Lit (Bool True)) :@: []) = Node "true" []
+toTerm (Builtin (Lit (Bool False)) :@: []) = Node "false" []
 toTerm (Lam ls e) = Node "\\" (map (\ (Local x _) -> Node x []) ls ++ [toTerm e])
 toTerm e = error $ "toTerm: " ++ ppRender e
 
