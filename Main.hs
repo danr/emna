@@ -208,9 +208,13 @@ obligations args fm pre_passes thy0 =
              runPasses
                (pre_passes ++ [Induction coords])
                (thy0 { thy_asserts = fm{ fm_body = body' } : thy_asserts thy0})
-      | coords <- combine [ i | (_,i) <- formulaVars fm `zip` [0..] ]
+      | coords <- combine [ i | (Local _ (TyCon t _),i) <- formulaVars fm `zip` [0..]
+                              , Just DatatypeInfo{} <- [lookupType t scp]
+                              ]
       ]
   where
+  scp = scope thy0
+
   combine xs =
     do i <- [0] ++ reverse [1..indvars args]
        us <- replicateM i xs
