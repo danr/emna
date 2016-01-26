@@ -95,6 +95,7 @@ main = do
       (runPasses $
         [ RemoveNewtype
         , UncurryTheory
+        , RemoveAliases, CollapseEqual
         , SimplifyGently
         ] ++
         [ RemoveBuiltinBool | rmb ])

@@ -101,8 +101,18 @@ toTerm (Builtin At :@: xs) = Node "@" (map toTerm xs)
 toTerm (Builtin Not :@: xs) = Node "not" (map toTerm xs)
 toTerm (Builtin And :@: xs) = Node "&&" (map toTerm xs)
 toTerm (Builtin Or :@: xs) = Node "||" (map toTerm xs)
+toTerm (Builtin IntAdd :@: xs) = Node "+"   (map toTerm xs)
+toTerm (Builtin IntSub :@: xs) = Node "-"   (map toTerm xs)
+toTerm (Builtin IntMul :@: xs) = Node "*"   (map toTerm xs)
+toTerm (Builtin IntDiv :@: xs) = Node "div" (map toTerm xs)
+toTerm (Builtin IntMod :@: xs) = Node "mod" (map toTerm xs)
+toTerm (Builtin IntGt  :@: xs) = Node ">"   (map toTerm xs)
+toTerm (Builtin IntGe  :@: xs) = Node ">="  (map toTerm xs)
+toTerm (Builtin IntLt  :@: xs) = Node "<"   (map toTerm xs)
+toTerm (Builtin IntLe  :@: xs) = Node "<="  (map toTerm xs)
 toTerm (Builtin (Lit (Bool True)) :@: []) = Node "true" []
 toTerm (Builtin (Lit (Bool False)) :@: []) = Node "false" []
+toTerm (Builtin (Lit (Int x)) :@: []) = Node (show x) []
 toTerm (Lam ls e) = Node "\\" (map (\ (Local x _) -> Node x []) ls ++ [toTerm e])
 toTerm e = error $ "toTerm: " ++ ppRender e
 
