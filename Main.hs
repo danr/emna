@@ -93,7 +93,8 @@ main = do
   passes rmb =
     head . freshPass
       (runPasses $
-        [ UncurryTheory
+        [ RemoveNewtype
+        , UncurryTheory
         , SimplifyGently
         ] ++
         [ RemoveBuiltinBool | rmb ])
