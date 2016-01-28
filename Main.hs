@@ -83,11 +83,13 @@ main = do
       do let (rmb,p) = case prover of
                         'w':_ -> (True, waldmeister)
                         'z':_ -> (False,z3)
-         m <- loop args p =<<
+         l <- loop args p =<<
            ((if explore then exploreTheory else return)
             (passes rmb (ren thy)) )
-         putStrLn "\nSummary:"
-         m
+         case l of
+           Left  e -> error $ "Failed to prove formula(s):\n" ++ (show e)
+           Right m -> do putStrLn "\nSummary:"
+                         m
   where
   ren = renameWith (\ x -> [ I i (varStr x) | i <- [0..] ])
   passes rmb =
@@ -117,16 +119,16 @@ isUserAsserted f = case (fm_info f) of
                      UserAsserted -> True
                      _            -> False
 
-loop :: Name a => Args -> Prover -> Theory a -> IO (IO ())
+loop :: Name a => Args -> Prover -> Theory a -> IO (Either [Formula a] (IO ()))
 loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   where
   (conjs,assums) = theoryGoals thy
 
   go _     []     [] _  = do putStrLn "Finished!"
-                             return (return ())
-  go False []     q _   = if (or $ map isUserAsserted q)
-                            then error "Failed to prove all assertions" -- TODO More elegant error?
-                            else return (return ())
+                             return $ Right (return ())
+  go False []     q  _  = if (or $ map isUserAsserted q)
+                            then return $ Left q
+                            else return $ Right (return ())
   go True  []     q thy = do putStrLn "Reconsidering conjectures..."
                              go False (reverse q) [] thy
   go b     (c:cs) q thy =
@@ -135,11 +137,14 @@ loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
          Just lemmas ->
            do let lms = thy_asserts thy
               let n = (length lms)
-              m <- go True cs q thy{ thy_asserts = makeProved n c:lms }
-              return $ do putStrLn $ pad (show n) 2 ++ ": " ++ rpad str 40 ++
+              g <- go True cs q thy{ thy_asserts = makeProved n c:lms }
+              case g of
+                Right m -> return $
+                  Right $ do putStrLn $ pad (show n) 2 ++ ": " ++ rpad str 40 ++
                                      if null lemmas then ""
                                         else " using " ++ intercalate ", " (map show lemmas)
-                          m
+                             m
+                l -> return l
          Nothing -> go b    cs (c:q) thy
 
 makeProved :: Int -> Formula a -> Formula a
