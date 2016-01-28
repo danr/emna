@@ -112,6 +112,11 @@ instance Name I where
   freshNamed s      = refresh (I undefined s)
   getUnique (I u _) = u
 
+isUserAsserted :: Formula a -> Bool
+isUserAsserted f = case (fm_info f) of
+                     UserAsserted -> True
+                     _            -> False
+
 loop :: Name a => Args -> Prover -> Theory a -> IO (IO ())
 loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   where
@@ -119,7 +124,9 @@ loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
 
   go _     []     [] _  = do putStrLn "Finished!"
                              return (return ())
-  go False []     _ _   = return (return ())
+  go False []     q _   = if (or $ map isUserAsserted q)
+                            then error "Failed to prove all assertions" -- TODO More elegant error?
+                            else return (return ())
   go True  []     q thy = do putStrLn "Reconsidering conjectures..."
                              go False (reverse q) [] thy
   go b     (c:cs) q thy =
