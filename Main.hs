@@ -83,11 +83,13 @@ main = do
       do let (rmb,p) = case prover of
                         'w':_ -> (True, waldmeister)
                         'z':_ -> (False,z3)
-         m <- loop args p =<<
+         l <- loop args p =<<
            ((if explore then exploreTheory else return)
             (passes rmb (ren thy)) )
-         putStrLn "\nSummary:"
-         m
+         case l of
+           Left  e -> error $ "Failed to prove formula(s):\n  " ++ (intercalate "\n  " e)
+           Right m -> do putStrLn "\nSummary:"
+                         m
   where
   ren = renameWith (\ x -> [ I i (varStr x) | i <- [0..] ])
   passes rmb =
@@ -112,14 +114,25 @@ instance Name I where
   freshNamed s      = refresh (I undefined s)
   getUnique (I u _) = u
 
-loop :: Name a => Args -> Prover -> Theory a -> IO (IO ())
+isUserAsserted :: Formula a -> Bool
+isUserAsserted f = case (fm_info f) of
+                     UserAsserted -> True
+                     _            -> False
+
+showFormula :: Name a => Formula a -> Theory a -> String
+showFormula fm thy = ppTerm $ toTerm $ snd $ extractQuantifiedLocals fm thy
+
+loop :: Name a => Args -> Prover -> Theory a -> IO (Either [String] (IO ()))
 loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   where
   (conjs,assums) = theoryGoals thy
 
   go _     []     [] _  = do putStrLn "Finished!"
-                             return (return ())
-  go False []     _ _   = return (return ())
+                             return $ Right (return ())
+  go False []     q  _  = do let q' = filter isUserAsserted q
+                             if (not $ null q')
+                               then return $ Left $ map (flip showFormula thy) q'
+                               else return $ Right (return ())
   go True  []     q thy = do putStrLn "Reconsidering conjectures..."
                              go False (reverse q) [] thy
   go b     (c:cs) q thy =
@@ -128,11 +141,14 @@ loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
          Just lemmas ->
            do let lms = thy_asserts thy
               let n = (length lms)
-              m <- go True cs q thy{ thy_asserts = makeProved n c:lms }
-              return $ do putStrLn $ pad (show n) 2 ++ ": " ++ rpad str 40 ++
+              g <- go True cs q thy{ thy_asserts = makeProved n c:lms }
+              case g of
+                Right m -> return $
+                  Right $ do putStrLn $ pad (show n) 2 ++ ": " ++ rpad str 40 ++
                                      if null lemmas then ""
                                         else " using " ++ intercalate ", " (map show lemmas)
-                          m
+                             m
+                l -> return l
          Nothing -> go b    cs (c:q) thy
 
 makeProved :: Int -> Formula a -> Formula a
@@ -141,11 +157,14 @@ makeProved i (Formula _ _ tvs b) = Formula Assert (Lemma i) tvs b
 formulaVars :: Formula a -> [Local a]
 formulaVars = fst . forallView . fm_body
 
+extractQuantifiedLocals :: Name a => Formula a -> Theory a -> ([Local String], Expr String)
+extractQuantifiedLocals fm thy =
+             forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
+             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
+
 tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO (String,Maybe [Int])
 tryProve args prover fm thy =
-  do let (prenex,term) =
-           forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
-             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
+  do let (prenex,term) = extractQuantifiedLocals fm thy
 
      putStrLn "Considering:"
      putStrLn $ "  " ++ (ppTerm (toTerm term))
