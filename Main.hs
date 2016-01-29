@@ -87,7 +87,7 @@ main = do
            ((if explore then exploreTheory else return)
             (passes rmb (ren thy)) )
          case l of
-           Left  e -> error $ "Failed to prove formula(s):\n" ++ (show e)
+           Left  e -> error $ "Failed to prove formula(s):\n  " ++ (intercalate "\n  " e)
            Right m -> do putStrLn "\nSummary:"
                          m
   where
@@ -119,16 +119,20 @@ isUserAsserted f = case (fm_info f) of
                      UserAsserted -> True
                      _            -> False
 
-loop :: Name a => Args -> Prover -> Theory a -> IO (Either [Formula a] (IO ()))
+showFormula :: Name a => Formula a -> Theory a -> String
+showFormula fm thy = ppTerm $ toTerm $ snd $ extractQuantifiedLocals fm thy
+
+loop :: Name a => Args -> Prover -> Theory a -> IO (Either [String] (IO ()))
 loop args prover thy = go False conjs [] thy{ thy_asserts = assums }
   where
   (conjs,assums) = theoryGoals thy
 
   go _     []     [] _  = do putStrLn "Finished!"
                              return $ Right (return ())
-  go False []     q  _  = if (or $ map isUserAsserted q)
-                            then return $ Left q
-                            else return $ Right (return ())
+  go False []     q  _  = do let q' = filter isUserAsserted q
+                             if (not $ null q')
+                               then return $ Left $ map (flip showFormula thy) q'
+                               else return $ Right (return ())
   go True  []     q thy = do putStrLn "Reconsidering conjectures..."
                              go False (reverse q) [] thy
   go b     (c:cs) q thy =
