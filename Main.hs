@@ -153,11 +153,14 @@ makeProved i (Formula _ _ tvs b) = Formula Assert (Lemma i) tvs b
 formulaVars :: Formula a -> [Local a]
 formulaVars = fst . forallView . fm_body
 
+extractQuantifiedLocals :: Name a => Formula a -> Theory a -> ([Local String], Expr String)
+extractQuantifiedLocals fm thy =
+             forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
+             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
+
 tryProve :: Name a => Args -> Prover -> Formula a -> Theory a -> IO (String,Maybe [Int])
 tryProve args prover fm thy =
-  do let (prenex,term) =
-           forallView $ fm_body $ head $ thy_asserts $ fmap (\ (Ren x) -> x)
-             $ niceRename thy thy{thy_asserts = [fm], thy_funcs=[]}
+  do let (prenex,term) = extractQuantifiedLocals fm thy
 
      putStrLn "Considering:"
      putStrLn $ "  " ++ (ppTerm (toTerm term))
