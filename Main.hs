@@ -275,7 +275,7 @@ isSuccess Success{} = True
 isSuccess _         = False
 
 data Prover = Prover
-  { prover_cmd    :: String -> (String,[String])
+  { prover_cmd    :: String -> Double -> (String,[String])
   , prover_ext    :: String
   , prover_pre    :: [StandardPass]
   , prover_post   :: [StandardPass]
@@ -284,13 +284,13 @@ data Prover = Prover
   }
 
 promise :: Name a => Args -> Prover -> Obligation (Theory a) -> IO (Promise [Obligation Result])
-promise args Prover{..} (Obligation info thy) =
+promise params Prover{..} (Obligation info thy) =
   do u <- newUnique
      let filename = "/tmp/" ++ show (hashUnique u) ++ prover_ext
-     when (filenames args) (putStrLn filename)
+     when (filenames params) (putStrLn filename)
      let (thy_pretty,axiom_list) = prover_pretty thy (head (freshPass (runPasses prover_post) thy))
      writeFile filename (show thy_pretty)
-     let (prog,args) = prover_cmd filename
+     let (prog,args) = prover_cmd filename (timeout params)
      promise <- processPromise prog args ""
 
      let update :: PromiseResult ProcessResult -> PromiseResult [Obligation Result]
@@ -300,9 +300,12 @@ promise args Prover{..} (Obligation info thy) =
 
      return promise{ result = fmap update (result promise) }
 
+showCeil :: Double -> String
+showCeil = show . (ceiling :: Double -> Integer)
+
 z3 :: Prover
 z3 = Prover
-  { prover_cmd = \ filename -> ("z3",["-smt2",filename])
+  { prover_cmd = \ filename t -> ("z3",["-smt2",filename,"-t:" ++ showCeil (t*1000)])
   , prover_ext = ".smt2"
   , prover_pre =
       [ TypeSkolemConjecture, Monomorphise False
@@ -325,7 +328,7 @@ z3 = Prover
 
 waldmeister :: Prover
 waldmeister = Prover
-  { prover_cmd = \ filename -> ("waldmeister",filename:["--auto","--output=/dev/stderr","--pcl"])
+  { prover_cmd = \ filename t -> ("waldmeister",filename:["--auto","--output=/dev/stderr","--pcl","--expert","-tl",showCeil t])
   , prover_ext = ".w"
   , prover_pre =
       [ TypeSkolemConjecture, Monomorphise False
@@ -336,6 +339,7 @@ waldmeister = Prover
   , prover_post =
       [ AxiomatizeFuncdefs2, AxiomatizeDatadeclsUEQ
       , SkolemiseConjecture
+      , UniqLocals
       ]
   , prover_pretty = \ orig -> Waldmeister.ppTheory . niceRename orig
   , prover_pipe =
