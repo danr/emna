@@ -54,6 +54,7 @@ data Args =
   Args
     { file    :: String
     , explore :: Bool
+    , extra   :: [String]
     , indvars :: Int
     , timeout :: Double
     , filenames :: Bool
@@ -66,6 +67,7 @@ defArgs =
   Args
     { file    = ""    &= argPos 0 &= typFile
     , explore = True  &= name "e" &= help "Explore theory"
+    , extra   = []                &= help "Additional functions for exploration"
     , indvars = 1     &= name "v" &= help "Number of variables to do induction on"
     , timeout = 1     &= name "t" &= help "Timeout in seconds (default 1)"
     , filenames = False           &= help "Print out filenames of theories"
@@ -76,7 +78,7 @@ defArgs =
 main :: IO ()
 main = do
   args@Args{..} <- cmdArgs defArgs
-  x <- readHaskellOrTipFile file defaultParams
+  x <- readHaskellOrTipFile file defaultParams{ extra_names = extra }
   case x of
     Left err  -> putStrLn err
     Right thy ->
