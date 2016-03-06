@@ -317,6 +317,7 @@ z3 = Prover
       ]
   , prover_post =
       [ AxiomatizeFuncdefs2
+      , RemoveMatch -- in case they appear in conjectures
       , SkolemiseConjecture
       , NegateConjecture
       ]
